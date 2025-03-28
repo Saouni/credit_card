@@ -1,0 +1,457 @@
+!pip install mlflow sagemaker-mlflow
+!pip install imblearn
+#importing the necessary libraries
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+from sklearn.feature_selection import RFE
+
+import boto3
+#defining s3 bucket and file path
+bucket='saobucketfraudetector'
+file_path='creditcard.csv'
+
+# Load the dataset from S3 using Boto3
+s3 = boto3.client('s3')
+obj = s3.get_object(Bucket=bucket, Key=file_path)
+credit_data = pd.read_csv(obj['Body'])
+
+# Displaying the first few rows of the dataset
+print(credit_data)
+
+# Checking for missing values
+print(credit_data.isnull().sum())
+
+#creating 2 variables for analysis
+legit=credit_data[credit_data.Class==0]
+fraud=credit_data[credit_data.Class==1]
+
+legit.shape
+
+fraud.shape
+
+# UnderSampling the dataset to balance the classes
+legit_sample = legit.sample(n=492)
+
+legit_sample.shape
+
+new_df = pd.concat([legit_sample, fraud], axis=0)
+
+new_df.head()
+
+# Feature Engineering: Creating interaction terms
+new_df['V1_V2'] = new_df['V1'] * new_df['V2']
+new_df['V3_V4'] = new_df['V3'] * new_df['V4']
+
+# Removing highly correlated features
+corr_matrix = new_df.corr().abs()
+mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+upper = corr_matrix.where(mask)
+to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+
+to_drop
+
+new_df.drop(columns=to_drop, inplace=True)
+
+new_df.head()
+
+# Visualizing the correlation matrix
+plt.figure(figsize=(12, 10))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt='.2f')
+plt.title('Correlation Matrix')
+plt.show()
+
+# Splitting the data into features and target
+X = new_df.drop(columns='Class', axis=1)
+y = new_df['Class']
+
+X
+
+# Feature Scaling
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Handling Class Imbalance using SMOTE
+smote = SMOTE(random_state=2)
+X_resampled, y_resampled = smote.fit_resample(X_scaled, y)
+
+# Splitting the resampled data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, stratify=y_resampled, random_state=2)
+
+# Combining features and target for saving
+train_data = pd.DataFrame(X_train)
+train_data['Class'] = y_train
+test_data = pd.DataFrame(X_test)
+test_data['Class'] = y_test
+
+# Saving to CSV
+train_data.to_csv('train_data.csv', index=False)
+test_data.to_csv('test_data.csv', index=False)
+
+# Initializing the S3 client
+s3 = boto3.client('s3')
+
+# Uploading the files to S3
+s3.upload_file('train_data.csv', bucket, 'datasets/train_data.csv')
+s3.upload_file('test_data.csv', bucket, 'datasets/test_data.csv')
+print(f'Train and test data uploaded to s3://{bucket}/datasets')
+
+import sagemaker
+from sagemaker.feature_store.feature_group import FeatureGroup
+from sagemaker.session import Session
+from sagemaker.sklearn.estimator import SKLearn
+import os
+
+import time
+
+# Adding an event time feature to the dataset
+new_df['event_time'] = pd.to_datetime('now').strftime('%Y-%m-%dT%H:%M:%SZ')
+
+new_df
+
+import uuid
+
+# Add unique TransactionID column
+new_df["record_id"] = [str(uuid.uuid4()) for _ in range(len(new_df))]
+new_df["record_id"] = new_df["record_id"].astype(str)
+
+import logging
+from sagemaker.feature_store.feature_definition import FeatureDefinition,FeatureTypeEnum
+from sagemaker.feature_store.feature_group import FeatureGroup, IngestionError  # Import IngestionError
+import sagemaker
+
+# Initialize SageMaker session
+sagemaker_session = sagemaker.Session()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# Define feature group
+feature_group_name = 'credit-card-fraud-feature-groupV1'
+feature_group = FeatureGroup(
+    name=feature_group_name,
+    sagemaker_session=sagemaker_session,
+    feature_definitions=[
+        FeatureDefinition(feature_name='V1_V2', feature_type=FeatureTypeEnum.FRACTIONAL),
+        FeatureDefinition(feature_name='V3_V4', feature_type=FeatureTypeEnum.FRACTIONAL),
+        FeatureDefinition(feature_name='event_time', feature_type=FeatureTypeEnum.STRING),
+        FeatureDefinition(feature_name='record_id', feature_type=FeatureTypeEnum.STRING),
+        # Add other feature definitions here
+    ]
+)
+
+
+# Create feature group
+feature_group.create(
+    s3_uri=f's3://saobucketfraudetector/feature-store',
+    record_identifier_name='record_id',
+    event_time_feature_name='event_time',
+    role_arn='arn:aws:iam::361769587425:role/service-role/AmazonSageMaker-ExecutionRole-20250204T104128',
+    enable_online_store=True
+)
+
+import boto3
+
+# Initialize SageMaker client
+sagemaker_client = boto3.client('sagemaker')
+
+# Describe the Feature Group
+try:
+    response = sagemaker_client.describe_feature_group(FeatureGroupName='credit-card-fraud-feature-groupV1')
+    print("Feature Group Details:")
+    print(response)
+except sagemaker_client.exceptions.ResourceNotFound:
+    print("Feature Group not found. Please check the name and ensure it was created successfully.")
+
+# Check data types
+print(new_df.dtypes)
+
+# Inspect sample data
+sample_df = new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']].head(10)
+print("Sample Data:")
+print(sample_df)
+
+# Check for null values
+print("Null Values in  Dataset:")
+print(new_df.isnull().sum())
+
+# Validate data types
+print("Data Types in new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']]:")
+print(new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']].dtypes)
+
+# Check for special characters in 'record_id' and 'event_time'
+print("Special Characters in 'record_id':")
+print(new_df['record_id'].str.contains(r'[^\w\s]').sum())
+print("Special Characters in 'event_time':")
+print(new_df['event_time'].str.contains(r'[^\w\s]').sum())
+
+import re
+
+# Function to remove special characters
+def clean_column(column):
+    return column.apply(lambda x: re.sub(r'[^\w\s]', '', x))
+# Clean 'record_id' and 'event_time' columns
+new_df['record_id'] = clean_column(new_df['record_id'])
+new_df['event_time'] = clean_column(new_df['event_time'])
+
+# Inspect cleaned sample data
+sample_df = new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']]
+print("Cleaned Sample Data:")
+print(new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']])
+
+print("Special Characters in 'record_id':")
+print(new_df['record_id'].str.contains(r'[^\w\s]').sum())
+print("Special Characters in 'event_time':")
+print(new_df['event_time'].str.contains(r'[^\w\s]').sum())
+
+# Check DataFrame size
+print("DataFrame Size:")
+print(new_df.shape)
+
+# Validate feature definitions
+print("Feature Definitions:")
+for feature in feature_group.feature_definitions:
+    print(f"{feature.feature_name}: {feature.feature_type}")
+
+import pandas as pd
+import time
+from tqdm import tqdm
+import boto3
+
+# Initialize SageMaker client
+sagemaker_client = boto3.client('sagemaker')
+featurestore_runtime = boto3.client('sagemaker-featurestore-runtime')
+
+# Wait for feature group to be ready
+while feature_group.describe()["FeatureGroupStatus"] != "Created":
+    print("Waiting for Feature Group to be created...")
+    time.sleep(10)
+
+# Convert event_time to ISO-8601 format
+new_df['event_time'] = pd.to_datetime(new_df['event_time']).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+# Convert DataFrame to records
+def format_record(row):
+    return [
+        {"FeatureName": "V1_V2", "ValueAsString": str(row["V1_V2"])},
+        {"FeatureName": "V3_V4", "ValueAsString": str(row["V3_V4"])},
+        {"FeatureName": "record_id", "ValueAsString": row["record_id"]},
+        {"FeatureName": "event_time", "ValueAsString": row["event_time"]}
+    ]
+
+records = [format_record(row) for index, row in new_df[['V1_V2', 'V3_V4', 'record_id', 'event_time']].iterrows()]
+
+# Ingest in batches of 500
+batch_size = 500
+for i in tqdm(range(0, len(records), batch_size)):
+    batch = records[i : i + batch_size]
+    try:
+        for record in batch:
+            featurestore_runtime.put_record(FeatureGroupName=feature_group_name, Record=record)
+    except Exception as e:
+        print(f"Batch {i // batch_size} failed: {e}")
+
+import boto3
+
+# Initialize SageMaker Feature Store runtime client
+featurestore_runtime = boto3.client('sagemaker-featurestore-runtime')
+
+# Define the feature group name and record identifier
+feature_group_name = 'credit-card-fraud-feature-groupV1'
+record_id = 'record_id'  # Replace with an actual record ID from your dataset
+
+# Retrieve the record from the Feature Store
+response = featurestore_runtime.get_record(
+    FeatureGroupName=feature_group_name,
+    RecordIdentifierValueAsString=record_id
+)
+
+# Print the retrieved record
+print("Retrieved Record:")
+print(response)
+
+#train.py
+script_content = """
+import argparse
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score
+import joblib
+import os
+import numpy as np
+import mlflow
+import mlflow.sklearn
+
+def model_fn(model_dir):
+    model = joblib.load(os.path.join(model_dir, "model.joblib"))
+    return model
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-data-dir', type=str, default='/opt/ml/output/data')
+    parser.add_argument('--model-dir', type=str, default='/opt/ml/model')
+    parser.add_argument('--train', type=str, default='/opt/ml/input/data/train')
+    parser.add_argument('--test', type=str, default='/opt/ml/input/data/test')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Increase timeout for MLflow HTTP requests
+        os.environ['MLFLOW_HTTP_REQUEST_TIMEOUT'] = '300'  # Increase timeout to 300 seconds
+        mlflow.set_tracking_uri("http://52.207.216.244:5000")
+        
+        # Start an MLflow run
+        mlflow.start_run()
+
+        # Load the train and test datasets from S3
+        train_data = pd.read_csv(os.path.join(args.train, "train_data.csv"))
+        test_data = pd.read_csv(os.path.join(args.test, "test_data.csv"))
+
+        # Handle NaN and infinite values
+        train_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+        test_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+        train_data.dropna(inplace=True)
+        test_data.dropna(inplace=True)
+
+        # Split features and target
+        X_train = train_data.drop(columns='Class')
+        y_train = train_data['Class']
+        X_test = test_data.drop(columns='Class')
+        y_test = test_data['Class']
+
+        # Train the model
+        model = LogisticRegression()
+        model.fit(X_train, y_train)
+        
+        # Evaluate the model
+        y_pred = model.predict(X_test)
+        f1 = f1_score(y_test, y_pred)
+        print(f"F1 Score: {f1}")
+
+        # Log the model with MLflow
+        mlflow.sklearn.log_model(model, "model")
+        mlflow.log_metric("f1_score", f1)
+
+        # Save the model regardless of the F1 score
+        joblib.dump(model, os.path.join(args.model_dir, "model.joblib"))
+
+        # End the MLflow run
+        mlflow.end_run()
+        
+    except Exception as e:
+        print(f"Error during training: {e}")
+        raise
+
+"""
+
+with open('train.py', 'w') as file:
+    file.write(script_content)
+
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.sklearn.estimator import SKLearn
+
+# Create an estimator
+sagemaker_session = sagemaker.Session()
+role = 'arn:aws:iam::361769587425:role/service-role/AmazonSageMaker-ExecutionRole-20250204T104128'
+estimator = SKLearn(
+    entry_point="train.py",
+    role=role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    framework_version="0.23-1",
+    output_path=f"s3://saobucketfraudetector/modelsV2",
+    sagemaker_session=sagemaker_session,
+    dependencies=['requirements.txt']
+)
+
+
+# Fit the estimator
+estimator.fit({
+    "train": f"s3://saobucketfraudetector/datasets/train_data.csv",
+    "test": f"s3://saobucketfraudetector/datasets/test_data.csv"
+})
+
+# Print the S3 path where the model artifacts are stored
+print(f"Model artifacts are stored at: {estimator.model_data}")
+
+import sagemaker
+from sagemaker import image_uris
+
+# Specify the framework, version, and region
+framework = 'sklearn'
+version = '0.23-1'
+region = 'us-east-1'
+
+# Retrieve the image URI
+image_uri = image_uris.retrieve(framework, region, version)
+print(f"Image URI: {image_uri}")
+
+from sagemaker.model import Model
+
+sagemaker_session = sagemaker.Session()
+role = 'arn:aws:iam::361769587425:role/service-role/AmazonSageMaker-ExecutionRole-20250204T104128'
+# Create the model
+image_uri = '683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:0.23-1-cpu-py3'
+
+model = Model(
+    model_data=estimator.model_data,
+    role=role,
+    entry_point="train.py",
+    image_uri=image_uri,
+    sagemaker_session=sagemaker_session
+)
+
+# Print the S3 path where the model artifacts are stored
+print(f"Model artifacts are stored at: {estimator.model_data}")
+
+# Deploy the model for online inference
+predictor = model.deploy(
+    initial_instance_count=1,
+    instance_type="ml.m5.large",
+    endpoint_name ="fraud-detection-endpointV2"
+    
+)
+
+import boto3
+import pandas as pd
+import io
+
+# Initialize the runtime client
+runtime_client = boto3.client("sagemaker-runtime")
+
+# Sample input data (you can replace this with your actual input data)
+# Load test data (Ensure it has the same feature columns used for training)
+test_data = pd.read_csv("test_data.csv")
+
+# Convert dataframe to CSV string (without header and index)
+csv_data = test_data.to_csv(header=False, index=False).strip()
+
+# Get endpoint name (the one used for deployment)
+endpoint_name = "fraud-detection-endpointV2"
+
+try:
+    # Invoke the endpoint for prediction
+    response = runtime_client.invoke_endpoint(
+        EndpointName=endpoint_name,
+        ContentType="text/csv",  # Specify the CSV format
+        Body=csv_data
+    )
+
+    # Read and print the response
+    response_body = response["Body"].read().decode("utf-8")
+    print("Prediction response:", response_body)
+
+except Exception as e:
+    print(f"Error invoking endpoint: {e}")
+
+# !python train.py
+
